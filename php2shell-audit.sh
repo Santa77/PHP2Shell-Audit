@@ -124,6 +124,8 @@ assess() {
 probe_binary() {
   local p=$1 rp out ver label=Binary
   [[ -x $p && -f $p ]] || return 0
+  # Skip helper scripts such as php84-phar, php-config, phpize (not interpreters).
+  [[ ${p##*/} =~ ^(ls)?php[0-9.]*(-(cgi|fpm)[0-9.]*)?$ ]] || return 0
   rp=$(resolve "$p")
   [[ -z ${SEEN["bin:$rp"]+yes} ]] || return 0
   SEEN["bin:$rp"]=1
@@ -159,10 +161,13 @@ probe_processes() {
     comm=$(cat "$proc/comm" 2>/dev/null || :)
     case $comm in *php*|*PHP*|*httpd*|*apache*|*lsphp*|*lshttpd*|*franken*) ;; *) continue;; esac
     ns=$(readlink "$proc/ns/mnt" 2>/dev/null || :)
-    if [[ -n $selfns && -n $ns && $ns != "$selfns" ]]; then
+    # systemd sandboxing (PrivateTmp etc.) also gives a private mount namespace, so only
+    # treat the process as foreign when its cgroup indicates a container runtime.
+    if [[ -n $selfns && -n $ns && $ns != "$selfns" ]] \
+       && grep -Eqi 'docker|libpod|podman|kubepods|containerd|lxc|machine\.slice' "$proc/cgroup" 2>/dev/null; then
       if [[ -z ${SEEN["ns:$ns"]+yes} ]]; then
         SEEN["ns:$ns"]=1
-        add REVIEW "PHP/web process PID $pid ($comm) runs in another mount namespace (container?); host paths do not apply, audit it separately"
+        add REVIEW "PHP/web process PID $pid ($comm) runs in a container (other mount namespace); host paths do not apply, audit it separately"
       fi
       continue
     fi
