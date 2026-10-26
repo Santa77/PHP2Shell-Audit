@@ -12,7 +12,7 @@ Nástroj je navrhnutý pre **Linux bez väzby na konkrétnu distribúciu**: nepo
 - Linux s **Bash 4+** (skript používa asociatívne polia).
 - Nástroje `timeout` (povinný), `grep`, `head`, `sort`, `readlink`, `find`, `date` a bežné systémové utility.
 - **Root** práva sú silne odporúčané pre čítanie konfigurácií a procesných máp (`/proc`). Bez nich bude audit čiastočný.
-- Voliteľne: `dpkg-query`, `rpm`, `apk`, `pacman`, `nginx`, `apachectl`/`apache2ctl`/`httpd`, `docker`, `podman`, podľa toho, čo je na serveri dostupné.
+- Voliteľne: `ss` (mapovanie nginx → FPM), `dpkg-query`, `rpm`, `apk`, `pacman`, `nginx`, `apachectl`/`apache2ctl`/`httpd`, `docker`, `podman`, podľa toho, čo je na serveri dostupné.
 
 Nie je nutné mať nainštalovaný PHP CLI interpreter: skript dokáže vyhľadávať aj samostatné FPM a iné binárky.
 
@@ -60,9 +60,9 @@ echo "Exit code: $status"
 | PHP CLI a samostatné binárky | Vyhľadanie v `PATH`, typických systémových a dodávateľských cestách; verzia cez `-v` | CLI verzia nehovorí nič o verzii PHP na webe |
 | PHP-FPM | Hľadanie FPM bináriek; kontrola verzie cez `-v`; inventár vybraných konfigurácií poolov | Automaticky nepreukazuje mapovanie pool → web/vhost |
 | Apache `mod_php` | Prítomnosť modulu cez `-M`, načítané `libphp*.so` z procesných máp | Presnú verziu `.so` nemožno všeobecne odvodiť z `php -v`; vyžaduje overenie balíka |
-| Nginx / Apache | Detekcia `fastcgi_pass` z `nginx -T`, `proxy_fcgi` a `php*_module` z `apachectl -M` | Zaznamená routing, nie definitívny runtime cieľového socketu/upstreamu; `nginx -T` môže ako root vytvoriť chýbajúce log/cache cesty |
+| Nginx / Apache | Detekcia `fastcgi_pass` z `nginx -T`, `proxy_fcgi` a `php*_module` z `apachectl -M` | Nginx: `fastcgi_pass` (unix socket, `host:port`, `upstream` bloky) sa cez `ss -lnp` mapuje na bežiaci PHP-FPM proces a jeho verziu (vyžaduje root); nenamapované ciele (premenné, vzdialené hosty, bez root) sú `REVIEW`. Apache `proxy_fcgi` sa nemapuje automaticky. `nginx -T` môže ako root vytvoriť chýbajúce log/cache cesty |
 | Procesy | Prehliadka `/proc`, identifikácia relevantných spustiteľných súborov a detekcia ` (deleted)` | Prístup je závislý od práv a nastavení `/proc`; nepokrýva každú možnú implementáciu PHP |
-| Balíky | Skúsi nájsť vlastnícky balík cez `dpkg-query`, `rpm`, `apk` alebo `pacman` (bez podporovaného správcu balíkov je nález len `REVIEW`) | Pri verzii pod prahom hľadá obe CVE ID v changelogu balíka (`changelog.Debian.gz`, `rpm --changelog`): nájdené obe → `OK` (dôkaz o backporte), len jedno alebo žiadne → `REVIEW`. Zmienka v changelogu je indikácia, nie náhrada vendor advisory |
+| Balíky | Skúsi nájsť vlastnícky balík cez `dpkg-query`, `rpm`, `apk` alebo `pacman` (bez podporovaného správcu balíkov je nález len `REVIEW`) | Pri verzii pod prahom hľadá obe CVE ID v changelogu balíka (`changelog.Debian.gz`, `rpm --changelog`): nájdené obe → `OK` (dôkaz o backporte), len jedno alebo žiadne → `REVIEW`; výnimka: balíky z repozitárov sledujúcich upstream (Sury PPA, Remi) bez dôkazu v changelogu sú pod prahom `CRITICAL`, lebo backporty sa tam nečakajú. Zmienka v changelogu je indikácia, nie náhrada vendor advisory |
 | Kontajnery | Upozornenie na bežiace Docker/Podman kontajnery, ak sú nástroje dostupné | Nekontroluje PHP **vnútri** kontajnerov; procesy v kontajneri (iný mount namespace + cgroup kontajnera) sa hlásia ako `REVIEW` |
 | Vlastné inštalácie | Známe cesty pre Remi, Plesk, LiteSpeed a ďalšie; voliteľne `--deep` | Nezaručuje objavenie všetkých inštalácií, jailov a chrootov |
 

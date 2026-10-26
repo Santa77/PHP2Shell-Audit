@@ -8,7 +8,7 @@ export PATH="$PATH:/usr/local/sbin:/usr/sbin:/sbin"
 
 if ((BASH_VERSINFO[0] < 4)); then echo 'ERROR: Bash 4+ required (associative arrays).' >&2; exit 3; fi
 
-VERSION='1.2.0'
+VERSION='1.3.0'
 DEEP=0
 DEEP_CAP=250
 usage() {
@@ -23,6 +23,8 @@ for arg in "$@"; do
 done
 
 declare -A SEEN=()
+declare -A BINVER=()       # resolved binary path -> PHP version
+declare -A LISTEN_PID=()   # listening address (unix path or host:port) -> pid
 declare -a FINDINGS=()
 declare -a DETAILS=()
 CRITICAL=0; REVIEW=0; GOOD=0; COUNT=0
@@ -85,6 +87,8 @@ package_info() {
   else printf 'unsupported'; fi
 }
 CVE_IDS=(CVE-2026-109618 CVE-2026-109619)
+# Third-party repos (Sury PPA, Remi) ship upstream releases and do not backport fixes to older point releases.
+tracks_upstream() { [[ $1 == *sury.org* || $1 == *.remi* ]]; }
 # Prints the CVE IDs mentioned in the owning package's changelog (offline backport evidence).
 changelog_cves() {
   local p=$1 pkg=$2 text='' f id found=''
@@ -134,7 +138,12 @@ assess() {
       case $owner in
         unresolved) add CRITICAL "$label PHP $phpver below fixed upstream version; no vendor backport evidence";;
         unsupported) add REVIEW "$label PHP $phpver below upstream fix; no supported package manager to verify backport";;
-        *) add REVIEW "$label PHP $phpver below upstream fix; verify vendor advisory/backport for $owner$note";;
+        *)
+          if tracks_upstream "$owner"; then
+            add CRITICAL "$label PHP $phpver below fixed upstream version; $owner tracks upstream releases (no backports expected)$note"
+          else
+            add REVIEW "$label PHP $phpver below upstream fix; verify vendor advisory/backport for $owner$note"
+          fi;;
       esac;;
     LEGACY)
       if [[ $owner == unresolved ]]; then
@@ -163,6 +172,7 @@ probe_binary() {
   # -n: no php.ini/extensions, so no extension code runs; clean env; no PHP script is executed.
   out=$(timeout -k 1 4 env -i PATH=/usr/bin:/bin HOME=/nonexistent "$rp" -n -v </dev/null 2>&1 | head -c 8192 || :)
   ver=$(version_from_text "$out")
+  [[ -n $ver ]] && BINVER["$rp"]=$ver
   if [[ -n $ver ]]; then assess "$label $(short "$p")" "$ver" "$rp"
   else add REVIEW "Cannot query version of $label $(short "$p")"; fi
 }
@@ -231,6 +241,64 @@ probe_processes() {
     fi
   done
 }
+collect_listeners() {
+  local line f
+  cmd ss || return 0
+  while IFS= read -r line; do
+    read -ra f <<<"$line"
+    [[ -n ${f[4]:-} && $line =~ pid=([0-9]+) ]] && LISTEN_PID["${f[4]}"]=${BASH_REMATCH[1]}
+  done < <(timeout 5 ss -lnpH 2>/dev/null)
+}
+# Prints the pid listening on a unix socket path or host:port (needs root for pids).
+listener_pid() {
+  local t=$1 rt k host port
+  if [[ $t == /* ]]; then
+    rt=$(resolve "$t")
+    for k in "$t" "$rt"; do [[ -n ${LISTEN_PID["$k"]+y} ]] && { printf '%s' "${LISTEN_PID[$k]}"; return 0; }; done
+    return 1
+  fi
+  host=${t%:*}; port=${t##*:}
+  [[ $host == localhost ]] && host=127.0.0.1
+  for k in "${!LISTEN_PID[@]}"; do
+    [[ $k == *":$port" ]] || continue
+    case ${k%:*} in "$host"|'*'|0.0.0.0|'[::]') printf '%s' "${LISTEN_PID[$k]}"; return 0;; esac
+  done
+  return 1
+}
+# Maps nginx fastcgi_pass targets to the PHP-FPM binary that actually listens there.
+map_nginx_fastcgi() {
+  local output=$1 t c pid exe state
+  local -A UPS=()
+  local -a unresolved=() targets=() concrete=()
+  local name srv okmsg bad
+  while read -r name srv; do UPS["$name"]+="${srv#unix:} "; done < <(awk '
+    /^[[:space:]]*upstream[[:space:]]+/ {n=$2; sub(/\{.*/,"",n); inup=1; next}
+    inup && /^[[:space:]]*server[[:space:]]+/ {sv=$2; sub(/;.*/,"",sv); print n, sv}
+    inup && /^[[:space:]]*\}/ {inup=0}' <<<"$output")
+  while read -r t; do targets+=("$t"); done < <(grep -E '^[[:space:]]*fastcgi_pass[[:space:]]+' <<<"$output" | sed -E 's/^[[:space:]]*fastcgi_pass[[:space:]]+//; s/[[:space:];].*$//' | sort -u)
+  for t in "${targets[@]}"; do
+    concrete=(); okmsg=''; bad=0
+    if [[ $t == unix:* ]]; then concrete=("${t#unix:}")
+    elif [[ -n ${UPS["$t"]+y} ]]; then read -ra concrete <<<"${UPS[$t]}"
+    elif [[ $t =~ ^[A-Za-z0-9.:_\[\]-]+:[0-9]+$ ]]; then concrete=("$t")
+    else unresolved+=("$t"); continue; fi
+    for c in "${concrete[@]}"; do
+      c=${c#unix:}
+      if [[ $c == *'$'* ]] || ! pid=$(listener_pid "$c"); then unresolved+=("$t($c)"); bad=1; continue; fi
+      exe=$(readlink "/proc/$pid/exe" 2>/dev/null || :)
+      [[ -n $exe ]] && exe=$(resolve "${exe% (deleted)}")
+      if [[ -z $exe || -z ${BINVER["$exe"]+y} ]]; then unresolved+=("$t($c -> pid $pid, unassessed binary)"); bad=1; continue; fi
+      state=$(version_status "${BINVER[$exe]}")
+      detail "nginx fastcgi_pass $t -> $c -> PID $pid $exe (PHP ${BINVER[$exe]}, $state)"
+      if [[ $state == OK ]]; then okmsg+="$exe PHP ${BINVER[$exe]}, "; else bad=1; fi
+    done
+    # Report OK only when every backend of this target is a fixed version.
+    ((bad == 0 && ${#concrete[@]} > 0)) && add OK "nginx fastcgi_pass $t is served only by fixed upstream versions (${okmsg%, })"
+  done
+  if ((${#unresolved[@]})); then
+    add REVIEW "Nginx FastCGI targets not mapped to an assessed PHP-FPM runtime: ${unresolved[*]}; verify manually (non-root, TCP/remote or variable targets)"
+  fi
+}
 probe_web_config() {
   local output f line cfg rc
   if cmd nginx; then
@@ -242,7 +310,8 @@ probe_web_config() {
     if grep -Eq '^[[:space:]]*fastcgi_pass[[:space:]]+' <<<"$output"; then
       detail 'nginx -T: active fastcgi_pass entries:'
       while IFS= read -r line; do detail "nginx: $(short "$line")"; done < <(grep -E '^[[:space:]]*(fastcgi_pass|upstream|server)[[:space:]]' <<<"$output" | head -n70)
-      add REVIEW 'Nginx FastCGI routing found: map each upstream/socket to a verified PHP-FPM runtime; binary inventory alone is insufficient'
+      collect_listeners
+      map_nginx_fastcgi "$output"
     fi
     grep -qi 'permission denied' <<<"$output" && add REVIEW 'nginx -T could not read all configuration: run as root'
   fi
