@@ -8,7 +8,7 @@ export PATH="$PATH:/usr/local/sbin:/usr/sbin:/sbin"
 
 if ((BASH_VERSINFO[0] < 4)); then echo 'ERROR: Bash 4+ required (associative arrays).' >&2; exit 3; fi
 
-VERSION='1.1.0'
+VERSION='1.2.0'
 DEEP=0
 DEEP_CAP=250
 usage() {
@@ -84,6 +84,19 @@ package_info() {
   elif ((tried)); then printf 'unresolved'
   else printf 'unsupported'; fi
 }
+CVE_IDS=(CVE-2026-109618 CVE-2026-109619)
+# Prints the CVE IDs mentioned in the owning package's changelog (offline backport evidence).
+changelog_cves() {
+  local p=$1 pkg=$2 text='' f id found=''
+  for f in "/usr/share/doc/$pkg/changelog.Debian.gz" "/usr/share/doc/$pkg/changelog.gz"; do
+    if [[ -r $f ]]; then text=$(timeout 8 gzip -dc -- "$f" 2>/dev/null | head -c 8000000 || :); break; fi
+  done
+  if [[ -z $text ]] && cmd rpm; then
+    text=$(timeout 10 rpm -qf --changelog -- "$p" 2>/dev/null | head -c 8000000 || :)
+  fi
+  for id in "${CVE_IDS[@]}"; do [[ $text == *"$id"* ]] && found+="$id "; done
+  printf '%s' "${found% }"
+}
 # A binary is executed only if it and every parent directory are root-owned and
 # not group/world-writable; otherwise an attacker-writable path could run code as root.
 safe_to_exec() {
@@ -98,24 +111,36 @@ safe_to_exec() {
   done
 }
 assess() {
-  local label=$1 phpver=$2 path=$3 state owner
+  local label=$1 phpver=$2 path=$3 state owner cves='' ncve=0 arr=() note
   ((COUNT+=1))
   state=$(version_status "$phpver")
   owner=$(package_info "$path")
-  detail "$label | version=$phpver | file=$path | package=$owner | threshold=$state"
+  if [[ $state == BELOW || $state == LEGACY ]]; then
+    case $owner in unresolved|unsupported) ;; *) cves=$(changelog_cves "$path" "${owner%%@*}");; esac
+    read -ra arr <<<"$cves"; ncve=${#arr[@]}
+  fi
+  detail "$label | version=$phpver | file=$path | package=$owner | threshold=$state | changelog_cves=${cves:-none}"
+  # Backport evidence from package changelog: all CVEs listed -> OK, some -> REVIEW, none -> REVIEW.
+  if ((ncve == ${#CVE_IDS[@]})); then
+    add OK "$label PHP $phpver: $state upstream, but changelog of $owner references $cves (backport evidence; confirm in vendor advisory)"
+    return 0
+  fi
+  if ((ncve > 0)); then note="; changelog references only $cves"
+  elif [[ $state == BELOW || $state == LEGACY ]]; then note='; no CVE reference in package changelog'
+  else note=''; fi
   case $state in
     OK) add OK "$label PHP $phpver: fixed upstream version";;
     BELOW)
       case $owner in
         unresolved) add CRITICAL "$label PHP $phpver below fixed upstream version; no vendor backport evidence";;
         unsupported) add REVIEW "$label PHP $phpver below upstream fix; no supported package manager to verify backport";;
-        *) add REVIEW "$label PHP $phpver below upstream fix; verify vendor advisory/backport for $owner";;
+        *) add REVIEW "$label PHP $phpver below upstream fix; verify vendor advisory/backport for $owner$note";;
       esac;;
     LEGACY)
       if [[ $owner == unresolved ]]; then
         add CRITICAL "$label PHP $phpver legacy/EOL and not owned by any package; migrate"
       else
-        add REVIEW "$label PHP $phpver legacy/EOL upstream; independently verify vendor backport for $owner (or migrate)"
+        add REVIEW "$label PHP $phpver legacy/EOL upstream; independently verify vendor backport for $owner (or migrate)$note"
       fi;;
     *) add REVIEW "$label PHP $phpver cannot be classified by this advisory";;
   esac

@@ -62,7 +62,7 @@ echo "Exit code: $status"
 | Apache `mod_php` | Prítomnosť modulu cez `-M`, načítané `libphp*.so` z procesných máp | Presnú verziu `.so` nemožno všeobecne odvodiť z `php -v`; vyžaduje overenie balíka |
 | Nginx / Apache | Detekcia `fastcgi_pass` z `nginx -T`, `proxy_fcgi` a `php*_module` z `apachectl -M` | Zaznamená routing, nie definitívny runtime cieľového socketu/upstreamu; `nginx -T` môže ako root vytvoriť chýbajúce log/cache cesty |
 | Procesy | Prehliadka `/proc`, identifikácia relevantných spustiteľných súborov a detekcia ` (deleted)` | Prístup je závislý od práv a nastavení `/proc`; nepokrýva každú možnú implementáciu PHP |
-| Balíky | Skúsi nájsť vlastnícky balík cez `dpkg-query`, `rpm`, `apk` alebo `pacman` (bez podporovaného správcu balíkov je nález len `REVIEW`) | **Neoveruje** konkrétny distribučný security advisory ani stav backportu |
+| Balíky | Skúsi nájsť vlastnícky balík cez `dpkg-query`, `rpm`, `apk` alebo `pacman` (bez podporovaného správcu balíkov je nález len `REVIEW`) | Pri verzii pod prahom hľadá obe CVE ID v changelogu balíka (`changelog.Debian.gz`, `rpm --changelog`): nájdené obe → `OK` (dôkaz o backporte), len jedno alebo žiadne → `REVIEW`. Zmienka v changelogu je indikácia, nie náhrada vendor advisory |
 | Kontajnery | Upozornenie na bežiace Docker/Podman kontajnery, ak sú nástroje dostupné | Nekontroluje PHP **vnútri** kontajnerov; procesy v kontajneri (iný mount namespace + cgroup kontajnera) sa hlásia ako `REVIEW` |
 | Vlastné inštalácie | Známe cesty pre Remi, Plesk, LiteSpeed a ďalšie; voliteľne `--deep` | Nezaručuje objavenie všetkých inštalácií, jailov a chrootov |
 
