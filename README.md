@@ -12,7 +12,7 @@ Nástroj je navrhnutý pre **Linux bez väzby na konkrétnu distribúciu**: nepo
 - Linux s **Bash 4+** (skript používa asociatívne polia).
 - Nástroje `timeout` (povinný), `grep`, `head`, `sort`, `readlink`, `find`, `date` a bežné systémové utility.
 - **Root** práva sú silne odporúčané pre čítanie konfigurácií a procesných máp (`/proc`). Bez nich bude audit čiastočný.
-- Voliteľne: `dpkg-query`, `rpm`, `nginx`, `apachectl`/`apache2ctl`/`httpd`, `docker`, `podman`, podľa toho, čo je na serveri dostupné.
+- Voliteľne: `dpkg-query`, `rpm`, `apk`, `pacman`, `nginx`, `apachectl`/`apache2ctl`/`httpd`, `docker`, `podman`, podľa toho, čo je na serveri dostupné.
 
 Nie je nutné mať nainštalovaný PHP CLI interpreter: skript dokáže vyhľadávať aj samostatné FPM a iné binárky.
 
@@ -51,7 +51,7 @@ status=${PIPESTATUS[0]}
 echo "Exit code: $status"
 ```
 
-`--deep` prehľadáva `/opt`, `/usr/local`, `/srv` a `/var/www`, len v rámci príslušného filesystému (`-xdev`), do hĺbky 7 úrovní a so stropom **250 kandidátov na jeden koreňový adresár**. Ide o ohraničené prehľadávanie, nie o kompletné prehľadanie disku.
+`--deep` prehľadáva `/opt`, `/usr/local`, `/srv` a `/var/www` (symlinky koreňov sa nasledujú), len v rámci príslušného filesystému (`-xdev`), do hĺbky 7 úrovní a so stropom **250 kandidátov na jeden koreňový adresár**; pri dosiahnutí stropu skript pridá nález `REVIEW`. Ide o ohraničené prehľadávanie, nie o kompletné prehľadanie disku.
 
 ## Čo skript kontroluje
 
@@ -60,10 +60,10 @@ echo "Exit code: $status"
 | PHP CLI a samostatné binárky | Vyhľadanie v `PATH`, typických systémových a dodávateľských cestách; verzia cez `-v` | CLI verzia nehovorí nič o verzii PHP na webe |
 | PHP-FPM | Hľadanie FPM bináriek; kontrola verzie cez `-v`; inventár vybraných konfigurácií poolov | Automaticky nepreukazuje mapovanie pool → web/vhost |
 | Apache `mod_php` | Prítomnosť modulu cez `-M`, načítané `libphp*.so` z procesných máp | Presnú verziu `.so` nemožno všeobecne odvodiť z `php -v`; vyžaduje overenie balíka |
-| Nginx | Detekcia `fastcgi_pass` z `nginx -T` | Zaznamená routing, nie definitívny runtime cieľového socketu/upstreamu |
+| Nginx / Apache | Detekcia `fastcgi_pass` z `nginx -T`, `proxy_fcgi` a `php*_module` z `apachectl -M` | Zaznamená routing, nie definitívny runtime cieľového socketu/upstreamu; `nginx -T` môže ako root vytvoriť chýbajúce log/cache cesty |
 | Procesy | Prehliadka `/proc`, identifikácia relevantných spustiteľných súborov a detekcia ` (deleted)` | Prístup je závislý od práv a nastavení `/proc`; nepokrýva každú možnú implementáciu PHP |
-| Balíky | Skúsi nájsť vlastnícky balík cez `dpkg-query` alebo `rpm` | **Neoveruje** konkrétny distribučný security advisory ani stav backportu |
-| Kontajnery | Upozornenie na bežiace Docker/Podman kontajnery, ak sú nástroje dostupné | Nekontroluje PHP **vnútri** kontajnerov |
+| Balíky | Skúsi nájsť vlastnícky balík cez `dpkg-query`, `rpm`, `apk` alebo `pacman` (bez podporovaného správcu balíkov je nález len `REVIEW`) | **Neoveruje** konkrétny distribučný security advisory ani stav backportu |
+| Kontajnery | Upozornenie na bežiace Docker/Podman kontajnery, ak sú nástroje dostupné | Nekontroluje PHP **vnútri** kontajnerov; procesy v inom mount namespace sa hlásia ako `REVIEW` |
 | Vlastné inštalácie | Známe cesty pre Remi, Plesk, LiteSpeed a ďalšie; voliteľne `--deep` | Nezaručuje objavenie všetkých inštalácií, jailov a chrootov |
 
 ### Verzie implementované v skripte 1.0.0
@@ -77,7 +77,7 @@ Konzervatívne porovnávacie prahy pre *upstream* vydania sú zakódované nasle
 | 8.4 | 8.4.27 |
 | 8.5 | 8.5.12 |
 
-**Verzie pred prahom nie sú automaticky dôkazom zraniteľnosti**, ak dodávateľ distribúcie zaviedol backport opravy. Iné vetvy vrátane PHP 8.1 a starších potrebujú samostatné posúdenie podpory a opráv. Prahy treba pred produkčným rozhodnutím porovnať s aktuálnymi primárnymi bezpečnostnými advisories PHP a distribútora; skript sám si ich neaktualizuje.
+**Verzie pred prahom nie sú automaticky dôkazom zraniteľnosti**, ak dodávateľ distribúcie zaviedol backport opravy. Vetvy 8.1 a staršie sa hlásia ako `LEGACY` (`REVIEW`, resp. `CRITICAL`, ak binárku nevlastní žiadny balík); iné vetvy potrebujú samostatné posúdenie. Prahy treba pred produkčným rozhodnutím porovnať s aktuálnymi primárnymi bezpečnostnými advisories PHP a distribútora; skript sám si ich neaktualizuje.
 
 ## Interpretácia výsledkov
 
@@ -130,7 +130,8 @@ Hodnota `Runtimes checked` predstavuje počet klasifikovaných runtime bináriek
 
 ## Bezpečnostné vlastnosti a prevádzkové riziká
 
-- Skript nemení konfiguráciu, balíky, súbory ani stav služieb a nepripája sa na internet.
+- Skript nemení konfiguráciu, balíky, súbory ani stav služieb a nepripája sa na internet (výnimka: `nginx -T`, pozri vyššie).
+- Binárky sa spúšťajú iba ako `php -n -v` s čistým prostredím (bez `php.ini` a rozšírení) a **len ak súbor aj všetky nadradené adresáre vlastní root a nie sú zapisovateľné skupinou ani ostatnými**; inak je nález `REVIEW` a binárka sa nespustí.
 - Spúšťa objavené PHP/PHP-FPM binárky iba s prepínačom `-v`, s časovým limitom 4 sekundy; **vykonanie neznámej lokálnej binárky aj s `-v` nie je absolútne bezrizikové**. Na nedôveryhodnom alebo už kompromitovanom hostiteľovi vykonávajte audit so zvýšenou opatrnosťou.
 - Spúšťa tiež nástroje `nginx -T` a Apache `-M` na prečítanie konfigurácie/modulov, s časovým limitom 8 sekúnd.
 - `--deep` môže zvýšiť diskové I/O. Na produkcii ho používajte uvážene.
