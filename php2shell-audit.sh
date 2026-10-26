@@ -8,9 +8,10 @@ export PATH="$PATH:/usr/local/sbin:/usr/sbin:/sbin"
 
 if ((BASH_VERSINFO[0] < 4)); then echo 'ERROR: Bash 4+ required (associative arrays).' >&2; exit 3; fi
 
-VERSION='1.3.0'
+VERSION='1.4.0'
 DEEP=0
 DEEP_CAP=250
+APACHE_DIRS='/etc/httpd /etc/apache2'
 usage() {
   printf 'Usage: sudo bash %s [--deep]\n--deep: bounded filesystem scan under common app locations (slower)\n' "$0"
 }
@@ -22,6 +23,7 @@ for arg in "$@"; do
   esac
 done
 
+MODPHP_ASSESSED=0; LISTENERS_DONE=0
 declare -A SEEN=()
 declare -A BINVER=()       # resolved binary path -> PHP version
 declare -A LISTEN_PID=()   # listening address (unix path or host:port) -> pid
@@ -177,13 +179,21 @@ probe_binary() {
   else add REVIEW "Cannot query version of $label $(short "$p")"; fi
 }
 probe_apache_module() {
-  local p=$1 rp pkg
+  local p=$1 rp pkg ver
   [[ -f $p ]] || return 0
   rp=$(resolve "$p")
   [[ -z ${SEEN["module:$rp"]+yes} ]] || return 0
   SEEN["module:$rp"]=1
   pkg=$(package_info "$rp")
-  # mod_php shared object does not expose a reliable generic version string.
+  # mod_php shared object does not expose a reliable version string; use the owner package's upstream version.
+  if [[ $pkg == *@* ]]; then
+    ver=${pkg#*@}; ver=${ver#*:}; ver=${ver%%[-+~]*}
+    if [[ $ver =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      MODPHP_ASSESSED=1
+      assess "Apache mod_php $(short "$rp")" "$ver" "$rp"
+      return 0
+    fi
+  fi
   detail "Apache PHP module | $rp | package=$pkg"
   add REVIEW "Apache mod_php $rp: determine exact build from owner package and vendor advisory; CLI version is NOT evidence"
 }
@@ -265,22 +275,18 @@ listener_pid() {
   done
   return 1
 }
-# Maps nginx fastcgi_pass targets to the PHP-FPM binary that actually listens there.
-map_nginx_fastcgi() {
-  local output=$1 t c pid exe state
-  local -A UPS=()
-  local -a unresolved=() targets=() concrete=()
-  local name srv okmsg bad
-  while read -r name srv; do UPS["$name"]+="${srv#unix:} "; done < <(awk '
-    /^[[:space:]]*upstream[[:space:]]+/ {n=$2; sub(/\{.*/,"",n); inup=1; next}
-    inup && /^[[:space:]]*server[[:space:]]+/ {sv=$2; sub(/;.*/,"",sv); print n, sv}
-    inup && /^[[:space:]]*\}/ {inup=0}' <<<"$output")
-  while read -r t; do targets+=("$t"); done < <(grep -E '^[[:space:]]*fastcgi_pass[[:space:]]+' <<<"$output" | sed -E 's/^[[:space:]]*fastcgi_pass[[:space:]]+//; s/[[:space:];].*$//' | sort -u)
-  for t in "${targets[@]}"; do
+declare -a FCGI_T=()
+declare -A FCGI_UPS=()
+# Maps FastCGI targets (FCGI_T, plus nginx upstream blocks in FCGI_UPS) to the PHP-FPM binary that actually listens there.
+map_fcgi_targets() {
+  local label=$1 t c pid exe state okmsg bad
+  local -a unresolved=() concrete=()
+  ((LISTENERS_DONE)) || { collect_listeners; LISTENERS_DONE=1; }
+  for t in ${FCGI_T[@]+"${FCGI_T[@]}"}; do
     concrete=(); okmsg=''; bad=0
     if [[ $t == unix:* ]]; then concrete=("${t#unix:}")
-    elif [[ -n ${UPS["$t"]+y} ]]; then read -ra concrete <<<"${UPS[$t]}"
-    elif [[ $t =~ ^[A-Za-z0-9.:_\[\]-]+:[0-9]+$ ]]; then concrete=("$t")
+    elif [[ -n ${FCGI_UPS["$t"]+y} ]]; then read -ra concrete <<<"${FCGI_UPS[$t]}"
+    elif [[ $t =~ ^[^[:space:]/]+:[0-9]+$ ]]; then concrete=("$t")
     else unresolved+=("$t"); continue; fi
     for c in "${concrete[@]}"; do
       c=${c#unix:}
@@ -289,15 +295,36 @@ map_nginx_fastcgi() {
       [[ -n $exe ]] && exe=$(resolve "${exe% (deleted)}")
       if [[ -z $exe || -z ${BINVER["$exe"]+y} ]]; then unresolved+=("$t($c -> pid $pid, unassessed binary)"); bad=1; continue; fi
       state=$(version_status "${BINVER[$exe]}")
-      detail "nginx fastcgi_pass $t -> $c -> PID $pid $exe (PHP ${BINVER[$exe]}, $state)"
+      detail "$label $t -> $c -> PID $pid $exe (PHP ${BINVER[$exe]}, $state)"
       if [[ $state == OK ]]; then okmsg+="$exe PHP ${BINVER[$exe]}, "; else bad=1; fi
     done
     # Report OK only when every backend of this target is a fixed version.
-    ((bad == 0 && ${#concrete[@]} > 0)) && add OK "nginx fastcgi_pass $t is served only by fixed upstream versions (${okmsg%, })"
+    ((bad == 0 && ${#concrete[@]} > 0)) && add OK "$label $t is served only by fixed upstream versions (${okmsg%, })"
   done
   if ((${#unresolved[@]})); then
-    add REVIEW "Nginx FastCGI targets not mapped to an assessed PHP-FPM runtime: ${unresolved[*]}; verify manually (non-root, TCP/remote or variable targets)"
+    add REVIEW "$label targets not mapped to an assessed PHP-FPM runtime: ${unresolved[*]}; verify manually (non-root, TCP/remote or variable targets)"
   fi
+}
+map_nginx_fastcgi() {
+  local output=$1 t name srv
+  FCGI_T=(); FCGI_UPS=()
+  while read -r name srv; do FCGI_UPS["$name"]+="${srv#unix:} "; done < <(awk '
+    /^[[:space:]]*upstream[[:space:]]+/ {n=$2; sub(/\{.*/,"",n); inup=1; next}
+    inup && /^[[:space:]]*server[[:space:]]+/ {sv=$2; sub(/;.*/,"",sv); print n, sv}
+    inup && /^[[:space:]]*\}/ {inup=0}' <<<"$output")
+  while read -r t; do FCGI_T+=("$t"); done < <(grep -E '^[[:space:]]*fastcgi_pass[[:space:]]+' <<<"$output" | sed -E 's/^[[:space:]]*fastcgi_pass[[:space:]]+//; s/[[:space:];].*$//' | sort -u)
+  map_fcgi_targets 'nginx fastcgi_pass'
+}
+# Apache proxy_fcgi: collect "proxy:unix:/sock|fcgi://..." and fcgi://host:port targets from the config tree.
+map_apache_fcgi() {
+  local conf t
+  FCGI_T=(); FCGI_UPS=()
+  conf=$(grep -RhsE --include='*.conf' 'fcgi://' $APACHE_DIRS 2>/dev/null | grep -v '^[[:space:]]*#' || :)
+  while IFS= read -r t; do [[ -n $t ]] && FCGI_T+=("$t"); done < <({
+    grep -Eo 'proxy:unix:[^|"[:space:]]+' <<<"$conf" | sed 's/^proxy://'
+    grep -Eo 'fcgi://[A-Za-z0-9_.:-]+:[0-9]+' <<<"$conf" | sed 's#^fcgi://##'; } | sort -u)
+  if ((${#FCGI_T[@]})); then map_fcgi_targets 'apache proxy_fcgi'
+  else add REVIEW "Apache proxy_fcgi enabled but no fcgi targets found under $APACHE_DIRS; verify routing manually"; fi
 }
 probe_web_config() {
   local output f line cfg rc
@@ -310,7 +337,6 @@ probe_web_config() {
     if grep -Eq '^[[:space:]]*fastcgi_pass[[:space:]]+' <<<"$output"; then
       detail 'nginx -T: active fastcgi_pass entries:'
       while IFS= read -r line; do detail "nginx: $(short "$line")"; done < <(grep -E '^[[:space:]]*(fastcgi_pass|upstream|server)[[:space:]]' <<<"$output" | head -n70)
-      collect_listeners
       map_nginx_fastcgi "$output"
     fi
     grep -qi 'permission denied' <<<"$output" && add REVIEW 'nginx -T could not read all configuration: run as root'
@@ -323,10 +349,10 @@ probe_web_config() {
       fi
       if grep -Eq 'php[0-9_]*_module' <<<"$output"; then
         detail "Apache $cfg -M: $(grep -E 'php[0-9_]*_module' <<<"$output" | tr '\n' ' ')"
-        add REVIEW 'Apache PHP module enabled: module file/package and running worker must be verified'
+        ((MODPHP_ASSESSED)) || add REVIEW 'Apache PHP module enabled: module file/package and running worker must be verified'
       fi
       if grep -q 'proxy_fcgi_module' <<<"$output"; then
-        add REVIEW 'Apache proxy_fcgi enabled: map each SetHandler/ProxyPass fcgi target to a verified PHP-FPM runtime'
+        map_apache_fcgi
       fi
       break
     fi
