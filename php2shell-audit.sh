@@ -8,7 +8,7 @@ export PATH="$PATH:/usr/local/sbin:/usr/sbin:/sbin"
 
 if ((BASH_VERSINFO[0] < 4)); then echo 'ERROR: Bash 4+ required (associative arrays).' >&2; exit 3; fi
 
-VERSION='1.4.0'
+VERSION='1.4.1'
 DEEP=0
 DEEP_CAP=250
 APACHE_DIRS='/etc/httpd /etc/apache2'
@@ -290,7 +290,17 @@ map_fcgi_targets() {
     else unresolved+=("$t"); continue; fi
     for c in "${concrete[@]}"; do
       c=${c#unix:}
-      if [[ $c == *'$'* ]] || ! pid=$(listener_pid "$c"); then unresolved+=("$t($c)"); bad=1; continue; fi
+      if [[ $c == *'$'* ]]; then unresolved+=("$t($c)"); bad=1; continue; fi
+      if ! pid=$(listener_pid "$c"); then
+        # With listener data available (root + ss), a unix socket path that does not exist is a dead route:
+        # no PHP runs behind it right now (stale config or stopped service).
+        if [[ $c == /* && ! -e $c ]] && ((${#LISTEN_PID[@]} > 0)); then
+          detail "$label $t -> $c: socket does not exist, no listener (dead route: stale config or stopped service)"
+        else
+          unresolved+=("$t($c)"); bad=1
+        fi
+        continue
+      fi
       exe=$(readlink "/proc/$pid/exe" 2>/dev/null || :)
       [[ -n $exe ]] && exe=$(resolve "${exe% (deleted)}")
       if [[ -z $exe || -z ${BINVER["$exe"]+y} ]]; then unresolved+=("$t($c -> pid $pid, unassessed binary)"); bad=1; continue; fi
@@ -299,7 +309,7 @@ map_fcgi_targets() {
       if [[ $state == OK ]]; then okmsg+="$exe PHP ${BINVER[$exe]}, "; else bad=1; fi
     done
     # Report OK only when every backend of this target is a fixed version.
-    ((bad == 0 && ${#concrete[@]} > 0)) && add OK "$label $t is served only by fixed upstream versions (${okmsg%, })"
+    ((bad == 0)) && [[ -n $okmsg ]] && add OK "$label $t is served only by fixed upstream versions (${okmsg%, })"
   done
   if ((${#unresolved[@]})); then
     add REVIEW "$label targets not mapped to an assessed PHP-FPM runtime: ${unresolved[*]}; verify manually (non-root, TCP/remote or variable targets)"
