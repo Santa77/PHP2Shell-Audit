@@ -8,7 +8,7 @@ export PATH="$PATH:/usr/local/sbin:/usr/sbin:/sbin"
 
 if ((BASH_VERSINFO[0] < 4)); then echo 'ERROR: Bash 4+ required (associative arrays).' >&2; exit 3; fi
 
-VERSION='1.4.1'
+VERSION='1.5.0'
 DEEP=0
 DEEP_CAP=250
 APACHE_DIRS='/etc/httpd /etc/apache2'
@@ -88,6 +88,48 @@ package_info() {
   elif ((tried)); then printf 'unresolved'
   else printf 'unsupported'; fi
 }
+os_field() { grep -m1 "^$1=" /etc/os-release 2>/dev/null | cut -d= -f2- | tr -d '"' || :; }
+OS_ID=$(os_field ID); OS_LIKE=$(os_field ID_LIKE); OS_VERSION_ID=$(os_field VERSION_ID)
+case " $OS_ID $OS_LIKE " in
+  *' debian '*|*' ubuntu '*) OS_FAMILY=debian;;
+  *' rhel '*|*' fedora '*|*' centos '*|*' ol '*) OS_FAMILY=rhel;;
+  *' alpine '*) OS_FAMILY=alpine;;
+  *' arch '*) OS_FAMILY=arch;;
+  *' suse '*|*' opensuse'*) OS_FAMILY=suse;;
+  *) OS_FAMILY=other;;
+esac
+# State for the recommendations section (advice is only printed, never executed).
+declare -A REC_PKG=()    # package name -> repo kind (distro|sury|remi)
+declare -A REC_UNIT=()   # service units that must be restarted after the update
+REC_LEGACY=0; REC_CUSTOM=''; REC_SERIES=''
+F_NOT_ROOT=0; F_STALE=0; F_NOEXEC=0; F_CONTAINER=0; F_UNMAPPED=0
+fpm_unit_for() {
+  local p=$1 b=${1##*/} c
+  case $p in
+    /opt/remi/php*/root/usr/sbin/php-fpm) c=${p#/opt/remi/}; printf '%s-php-fpm' "${c%%/*}";;
+    /opt/plesk/php/*/sbin/php-fpm) c=${p#/opt/plesk/php/}; c=${c%%/*}; printf 'plesk-php%s-fpm' "${c//./}";;
+    */libphp*.so*) if [[ $OS_FAMILY == debian ]]; then printf 'apache2'; else printf 'httpd'; fi;;
+    */php-fpm[0-9]*) printf 'php%s-fpm' "${b#php-fpm}";;
+    */php-fpm) printf 'php-fpm';;
+  esac
+}
+rec_pkg() {
+  local owner=$1 state=$2 path=$3 pkg vers kind unit
+  [[ $state == LEGACY ]] && REC_LEGACY=1
+  case $owner in
+    unresolved) REC_CUSTOM+="$path ";;
+    unsupported) ;;
+    *)
+      pkg=${owner%%@*}; vers=${owner#*@}
+      if [[ $vers == *sury.org* ]]; then kind=sury; elif [[ $vers == *.remi* ]]; then kind=remi; else kind=distro; fi
+      REC_PKG["$pkg"]=$kind
+      if [[ $kind == sury && $vers =~ \+ubuntu([0-9]{2}\.[0-9]{2}) && -n $OS_VERSION_ID && ${BASH_REMATCH[1]} != "$OS_VERSION_ID" ]]; then
+        REC_SERIES="packages are built for Ubuntu ${BASH_REMATCH[1]} but this host is $OS_VERSION_ID"
+      fi;;
+  esac
+  unit=$(fpm_unit_for "$path"); [[ -n $unit ]] && REC_UNIT["$unit"]=1
+  return 0
+}
 CVE_IDS=(CVE-2026-109618 CVE-2026-109619)
 # Third-party repos (Sury PPA, Remi) ship upstream releases and do not backport fixes to older point releases.
 tracks_upstream() { [[ $1 == *sury.org* || $1 == *.remi* ]]; }
@@ -134,6 +176,7 @@ assess() {
   if ((ncve > 0)); then note="; changelog references only $cves"
   elif [[ $state == BELOW || $state == LEGACY ]]; then note='; no CVE reference in package changelog'
   else note=''; fi
+  [[ $state == BELOW || $state == LEGACY ]] && rec_pkg "$owner" "$state" "$path"
   case $state in
     OK) add OK "$label PHP $phpver: fixed upstream version";;
     BELOW)
@@ -167,6 +210,7 @@ probe_binary() {
   SEEN["bin:$rp"]=1
   [[ ${rp##*/} == php-fpm* ]] && label='FPM binary'
   if ! safe_to_exec "$rp"; then
+    F_NOEXEC=1
     detail "$label $rp not executed: not root-owned or group/world-writable path"
     add REVIEW "$label $(short "$p") not executed (untrusted ownership/permissions on file or parent directory); verify manually"
     return 0
@@ -198,7 +242,7 @@ probe_apache_module() {
   add REVIEW "Apache mod_php $rp: determine exact build from owner package and vendor advisory; CLI version is NOT evidence"
 }
 probe_processes() {
-  local proc pid exe line comm base deleted selfns ns lib
+  local proc pid exe line comm base deleted selfns ns lib unit
   selfns=$(readlink /proc/self/ns/mnt 2>/dev/null || :)
   for proc in /proc/[0-9]*; do
     pid=${proc##*/}
@@ -212,6 +256,7 @@ probe_processes() {
        && grep -Eqi 'docker|libpod|podman|kubepods|containerd|lxc|machine\.slice' "$proc/cgroup" 2>/dev/null; then
       if [[ -z ${SEEN["ns:$ns"]+yes} ]]; then
         SEEN["ns:$ns"]=1
+        F_CONTAINER=1
         add REVIEW "PHP/web process PID $pid ($comm) runs in a container (other mount namespace); host paths do not apply, audit it separately"
       fi
       continue
@@ -226,6 +271,7 @@ probe_processes() {
         if ((deleted)); then
           if [[ -z ${SEEN["deleted:$exe"]+yes} ]]; then
             SEEN["deleted:$exe"]=1
+            F_STALE=1; unit=$(fpm_unit_for "$exe"); [[ -n $unit ]] && REC_UNIT["$unit"]=1
             add CRITICAL "Running PHP process (e.g. PID $pid, $comm) uses deleted executable $exe; restart after confirming update"
           fi
         elif [[ -z ${SEEN["process:$exe"]+yes} ]]; then
@@ -242,6 +288,7 @@ probe_processes() {
         if [[ $line == *'(deleted)'* ]]; then
           if [[ -z ${SEEN["deletedlib:$lib"]+yes} ]]; then
             SEEN["deletedlib:$lib"]=1
+            F_STALE=1; unit=$(fpm_unit_for "$lib"); [[ -n $unit ]] && REC_UNIT["$unit"]=1
             add CRITICAL "PID $pid ($comm) retains deleted PHP shared library: $(short "$line")"
           fi
         elif [[ $lib == *libphp* ]]; then
@@ -312,6 +359,7 @@ map_fcgi_targets() {
     ((bad == 0)) && [[ -n $okmsg ]] && add OK "$label $t is served only by fixed upstream versions (${okmsg%, })"
   done
   if ((${#unresolved[@]})); then
+    F_UNMAPPED=1
     add REVIEW "$label targets not mapped to an assessed PHP-FPM runtime: ${unresolved[*]}; verify manually (non-root, TCP/remote or variable targets)"
   fi
 }
@@ -385,7 +433,7 @@ probe_fpm_configs() {
 printf 'PHP2Shell audit %s | %s | %s\n' "$VERSION" "$(clean "$(hostname 2>/dev/null || :)")" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 printf 'Scope: Linux local inventory; CVE-2026-109618 / CVE-2026-109619\n'
 cmd timeout || { echo 'ERROR: coreutils timeout required (no arbitrary binaries will be executed).' >&2; exit 3; }
-[[ $EUID -ne 0 ]] && add REVIEW 'Not running as root: inaccessible process maps/configurations may be missed'
+[[ $EUID -ne 0 ]] && F_NOT_ROOT=1 && add REVIEW 'Not running as root: inaccessible process maps/configurations may be missed'
 [[ -r /etc/os-release ]] && detail "OS: $(grep '^PRETTY_NAME=' /etc/os-release | head -n1)"
 # PATH, known bin paths and vendor-specific multi-PHP layouts
 while IFS= read -r p; do probe_binary "$p"; done < <(type -P -a php php-cgi php-fpm 2>/dev/null | sort -u)
@@ -414,18 +462,87 @@ probe_fpm_configs
 if (( COUNT == 0 )); then add REVIEW 'No introspectable PHP runtime discovered. Cannot conclude server is safe (containers, chroots, custom paths).'; fi
 if cmd docker; then
   if ! timeout 4 docker ps -q >/dev/null 2>&1; then
+    F_CONTAINER=1
     add REVIEW 'docker present but "docker ps" failed (no socket access?); containers not inspected'
   elif [[ -n $(timeout 4 docker ps -q 2>/dev/null) ]]; then
+    F_CONTAINER=1
     add REVIEW 'Running Docker containers detected; host-only audit cannot inspect container PHP runtimes; audit each container separately'
   fi
 fi
 if cmd podman && timeout 4 podman ps -q 2>/dev/null | grep -q .; then
+  F_CONTAINER=1
   add REVIEW 'Running Podman containers detected; audit PHP in each container separately'
 fi
+# Remediation advice tailored to OS family, package source and findings. Printed only; nothing is executed.
+recommendations() {
+  local pkg pm n=0 units='' u first fixed='8.2.35 / 8.3.36 / 8.4.27 / 8.5.12'
+  local -a lines=() sury=() remi=() distro=()
+  rec() { lines+=("$1"); }
+  if ((${#REC_PKG[@]})); then
+    for pkg in $(printf '%s\n' "${!REC_PKG[@]}" | sort); do
+      case ${REC_PKG[$pkg]} in sury) sury+=("$pkg");; remi) remi+=("$pkg");; *) distro+=("$pkg");; esac
+    done
+  fi
+  pm=yum; cmd dnf && pm=dnf
+  ((F_NOT_ROOT)) && rec "Run the audit as root (sudo bash $0): without root, process maps, listeners and configs are incomplete."
+  if ((${#distro[@]})); then
+    first=${distro[0]}
+    case $OS_FAMILY in
+      debian)
+        rec "Update distro packages: sudo apt update && sudo apt install --only-upgrade ${distro[*]}"
+        rec "Check a fix is published: apt-cache policy $first   (Candidate == Installed means no newer build in your enabled repos)"
+        rec "Check backport evidence: zcat /usr/share/doc/$first/changelog.Debian.gz | grep -E 'CVE-2026-10961[89]'"
+        [[ $OS_ID == ubuntu ]] && rec "If no fix is offered, check Ubuntu Pro / ESM Apps coverage: pro status ; pro security-status";;
+      rhel)
+        if [[ $pm == dnf ]]; then rec "Update distro packages: sudo dnf upgrade --refresh ${distro[*]}"
+        else rec "Update distro packages: sudo yum clean expire-cache && sudo yum upgrade ${distro[*]}"; fi
+        rec "Check advisories: $pm updateinfo info --cve CVE-2026-109618 CVE-2026-109619"
+        rec "Check backport evidence: rpm -q --changelog $first | grep -E 'CVE-2026-10961[89]'"
+        rec "If the PHP module stream is old: $pm module list php ; sudo $pm module reset php && sudo $pm module enable php:<newer-stream>";;
+      alpine) rec "Update packages: apk update && apk upgrade ${distro[*]}";;
+      arch) rec "Update packages: sudo pacman -Syu ${distro[*]}";;
+      suse) rec "Update packages: sudo zypper refresh && sudo zypper update ${distro[*]}";;
+      *) rec "Update ${distro[*]} with this system's package manager and verify the vendor advisory.";;
+    esac
+  fi
+  if ((${#sury[@]})); then
+    rec "Packages come from the Sury/Ondrej repo (${sury[*]}); it ships upstream releases, so the fix is simply a newer build."
+    rec "Verify the repo is enabled for this OS: grep -rhE 'ondrej|sury' /etc/apt/sources.list /etc/apt/sources.list.d/"
+    [[ -n $REC_SERIES ]] && rec "Stale repo series: $REC_SERIES. Re-add it for this release: sudo add-apt-repository ppa:ondrej/php (and ppa:ondrej/apache2 for mod_php), then sudo apt update"
+    rec "Update: sudo apt update && sudo apt install --only-upgrade ${sury[*]}"
+    rec "Check: apt-cache policy ${sury[0]}   (Candidate must be at or above the fixed version: $fixed)"
+  fi
+  if ((${#remi[@]})); then
+    rec "Packages come from the Remi repo (${remi[*]}); it ships upstream releases, so the fix is simply a newer build."
+    rec "Verify the repo is enabled: $pm repolist | grep -i remi"
+    rec "Update: sudo $pm clean expire-cache && sudo $pm upgrade ${remi[*]}"
+    rec "Check: $pm list available ${remi[0]}   (must be at or above the fixed version: $fixed)"
+  fi
+  [[ -n $REC_CUSTOM ]] && rec "Binaries without a package owner (${REC_CUSTOM% }): rebuild from a fixed upstream source release or replace them with a distro/vendor package, then remove the old files."
+  ((REC_LEGACY)) && rec "PHP 8.1 and older is end-of-life upstream: plan migration to a supported branch (8.3, 8.4 or 8.5); until then rely only on a verified vendor backport."
+  ((F_NOEXEC)) && rec "Binaries skipped for unsafe permissions: fix ownership/permissions (chown root:root, chmod go-w, including parent directories) or verify their version manually."
+  ((F_UNMAPPED)) && rec "Unmapped web routing: map targets manually with: sudo ss -lnp | grep -i php ; nginx -T | grep fastcgi_pass ; apachectl -S"
+  ((F_CONTAINER)) && rec "Containers: audit each one (docker exec <container> php -v), or rebuild the image from a fixed base (PHP at or above $fixed) and redeploy."
+  ((COUNT == 0)) && rec "No PHP runtime was found: re-run with --deep and check containers, chroots and custom install paths."
+  if ((${#REC_UNIT[@]})); then
+    for u in $(printf '%s\n' "${!REC_UNIT[@]}" | sort); do units+="$u "; done
+    rec "After updating, restart so running processes load the new binaries: sudo systemctl restart ${units% }"
+  elif ((F_STALE)); then
+    rec "Restart the PHP/web services that still run deleted binaries or libraries (php-fpm, apache2/httpd)."
+  fi
+  ((F_STALE)) && rec "Stale processes found: the package may already be updated but the services were not restarted."
+  if ((${#lines[@]})); then
+    lines+=("Re-run to confirm: sudo bash $0 --deep   (expected RESULT: OK)")
+    printf '\n== Recommendations (%s%s) ==\n' "${OS_ID:-unknown}" "${OS_VERSION_ID:+ $OS_VERSION_ID}"
+    for u in "${lines[@]}"; do n=$((n+1)); printf '  %d. %s\n' "$n" "$(clean "$u")"; done
+  fi
+}
+
 printf '\n== Findings ==\n'
 for line in ${FINDINGS[@]+"${FINDINGS[@]}"}; do printf '[%s] %s\n' "${line%%|*}" "${line#*|}"; done
 printf '\n== Inventory / details ==\n'
 for line in ${DETAILS[@]+"${DETAILS[@]}"}; do printf '  %s\n' "$line"; done
+recommendations
 printf '\n== SUMMARY ==\n'
 printf 'Runtimes checked: %d | Critical: %d | Review: %d | OK findings: %d\n' "$COUNT" "$CRITICAL" "$REVIEW" "$GOOD"
 if (( CRITICAL > 0 )); then
