@@ -8,7 +8,7 @@ export PATH="$PATH:/usr/local/sbin:/usr/sbin:/sbin"
 
 if ((BASH_VERSINFO[0] < 4)); then echo 'ERROR: Bash 4+ required (associative arrays).' >&2; exit 3; fi
 
-VERSION='1.5.0'
+VERSION='1.6.0'
 DEEP=0
 DEEP_CAP=250
 APACHE_DIRS='/etc/httpd /etc/apache2'
@@ -102,6 +102,8 @@ esac
 declare -A REC_PKG=()    # package name -> repo kind (distro|sury|remi)
 declare -A REC_UNIT=()   # service units that must be restarted after the update
 REC_LEGACY=0; REC_CUSTOM=''; REC_SERIES=''
+APT_SOURCES_LIST=/etc/apt/sources.list; APT_SOURCES_D=/etc/apt/sources.list.d; YUM_REPOS_D=/etc/yum.repos.d
+REPO_STATE=''; REPO_INFO=''     # third-party repo state: active|mismatch|disabled|absent (+ details)
 F_NOT_ROOT=0; F_STALE=0; F_NOEXEC=0; F_CONTAINER=0; F_UNMAPPED=0
 fpm_unit_for() {
   local p=$1 b=${1##*/} c
@@ -113,6 +115,50 @@ fpm_unit_for() {
     */php-fpm) printf 'php-fpm';;
   esac
 }
+# Is the Sury/Ondrej apt repo still enabled and does it match this release? (do-release-upgrade disables PPAs.)
+sury_repo_check() {
+  local f line suite codename active=0 disabled='' mismatch=''
+  codename=$(os_field VERSION_CODENAME); [[ -z $codename ]] && codename=$(os_field UBUNTU_CODENAME)
+  for f in "$APT_SOURCES_LIST" "$APT_SOURCES_D"/*; do
+    [[ -f $f ]] || continue
+    grep -qiE 'ondrej|sury' "$f" 2>/dev/null || continue
+    case $f in
+      *.list|*.sources) ;;
+      *) disabled+="$f "; continue;;   # leftovers such as *.save, *.distUpgrade, *.dpkg-old
+    esac
+    if [[ $f == *.sources ]]; then
+      if grep -qi '^Enabled:[[:space:]]*no' "$f"; then disabled+="$f "; continue; fi
+      suite=$(grep -i -m1 '^Suites:' "$f" | awk '{print $2}')
+      active=1
+      [[ -n $codename && -n $suite && $suite != "$codename" ]] && mismatch+="$f(suite $suite) "
+      continue
+    fi
+    while IFS= read -r line; do
+      if [[ $line =~ ^[[:space:]]*# ]]; then
+        disabled+="$f "
+      elif [[ $line =~ ^[[:space:]]*deb(-src)?[[:space:]]+(\[[^]]*\][[:space:]]+)?[^[:space:]]+[[:space:]]+([^[:space:]]+) ]]; then
+        active=1; suite=${BASH_REMATCH[3]}
+        [[ -n $codename && $suite != "$codename" ]] && mismatch+="$f(suite $suite) "
+      fi
+    done < <(grep -iE 'ondrej|sury' "$f")
+  done
+  if ((active)) && [[ -n $mismatch ]]; then REPO_STATE=mismatch; REPO_INFO="${mismatch% } vs host ${codename:-unknown}"
+  elif ((active)); then REPO_STATE=active; REPO_INFO="enabled for ${codename:-this release}"
+  elif [[ -n $disabled ]]; then REPO_STATE=disabled; REPO_INFO=$(printf '%s\n' $disabled | sort -u | tr '\n' ' '); REPO_INFO=${REPO_INFO% }
+  else REPO_STATE=absent; REPO_INFO='no Sury/Ondrej entry in apt sources'; fi
+  detail "Sury apt repo: $REPO_STATE ($REPO_INFO)"
+}
+remi_repo_check() {
+  local on files=("$YUM_REPOS_D"/*.repo)
+  # nullglob: with no repo files the list is empty, so never pass an empty list to awk/grep (they would read stdin).
+  if ((${#files[@]})); then
+    on=$(awk '/^\[/{sec=$0} /^enabled[[:space:]]*=[[:space:]]*1/ && sec ~ /remi/ {print sec}' "${files[@]}" 2>/dev/null | tr -d '[]' | tr '\n' ' ')
+  fi
+  if [[ -n ${on:-} ]]; then REPO_STATE=active; REPO_INFO="enabled: ${on% }"
+  elif ((${#files[@]})) && grep -qli remi "${files[@]}" 2>/dev/null; then REPO_STATE=disabled; REPO_INFO='remi repo files present but no remi repo enabled'
+  else REPO_STATE=absent; REPO_INFO='no Remi repo file in yum.repos.d'; fi
+  detail "Remi yum repo: $REPO_STATE ($REPO_INFO)"
+}
 rec_pkg() {
   local owner=$1 state=$2 path=$3 pkg vers kind unit
   [[ $state == LEGACY ]] && REC_LEGACY=1
@@ -123,6 +169,10 @@ rec_pkg() {
       pkg=${owner%%@*}; vers=${owner#*@}
       if [[ $vers == *sury.org* ]]; then kind=sury; elif [[ $vers == *.remi* ]]; then kind=remi; else kind=distro; fi
       REC_PKG["$pkg"]=$kind
+      if [[ -z $REPO_STATE ]]; then
+        if [[ $kind == sury && $OS_FAMILY == debian ]]; then sury_repo_check
+        elif [[ $kind == remi && $OS_FAMILY == rhel ]]; then remi_repo_check; fi
+      fi
       if [[ $kind == sury && $vers =~ \+ubuntu([0-9]{2}\.[0-9]{2}) && -n $OS_VERSION_ID && ${BASH_REMATCH[1]} != "$OS_VERSION_ID" ]]; then
         REC_SERIES="packages are built for Ubuntu ${BASH_REMATCH[1]} but this host is $OS_VERSION_ID"
       fi;;
@@ -507,14 +557,25 @@ recommendations() {
   fi
   if ((${#sury[@]})); then
     rec "Packages come from the Sury/Ondrej repo (${sury[*]}); it ships upstream releases, so the fix is simply a newer build."
-    rec "Verify the repo is enabled for this OS: grep -rhE 'ondrej|sury' /etc/apt/sources.list /etc/apt/sources.list.d/"
-    [[ -n $REC_SERIES ]] && rec "Stale repo series: $REC_SERIES. Re-add it for this release: sudo add-apt-repository ppa:ondrej/php (and ppa:ondrej/apache2 for mod_php), then sudo apt update"
+    case $REPO_STATE in
+      disabled) rec "The Sury apt repo is DISABLED ($REPO_INFO), typically by do-release-upgrade, so these packages no longer update. Re-enable it for this release: sudo add-apt-repository ppa:ondrej/php (and ppa:ondrej/apache2 for mod_php; on Debian use the packages.sury.org instructions), then sudo apt update";;
+      mismatch) rec "The Sury apt repo points to the wrong release ($REPO_INFO). Fix the suite or re-add it: sudo add-apt-repository ppa:ondrej/php, then sudo apt update";;
+      absent) rec "No Sury/Ondrej entry exists in apt sources, so these packages no longer update. Re-add it: sudo add-apt-repository ppa:ondrej/php (Debian: packages.sury.org), then sudo apt update";;
+      active) rec "The Sury apt repo is enabled ($REPO_INFO). If apt still offers no newer build, run sudo apt update and check for errors (GPG key, network).";;
+      *) rec "Verify the repo is enabled for this OS: grep -rhiE 'ondrej|sury' /etc/apt/sources.list /etc/apt/sources.list.d/";;
+    esac
+    [[ -n $REC_SERIES ]] && rec "Installed builds are from another release ($REC_SERIES), a leftover of an OS upgrade; updating will replace them."
     rec "Update: sudo apt update && sudo apt install --only-upgrade ${sury[*]}"
     rec "Check: apt-cache policy ${sury[0]}   (Candidate must be at or above the fixed version: $fixed)"
   fi
   if ((${#remi[@]})); then
     rec "Packages come from the Remi repo (${remi[*]}); it ships upstream releases, so the fix is simply a newer build."
-    rec "Verify the repo is enabled: $pm repolist | grep -i remi"
+    case $REPO_STATE in
+      disabled) rec "Remi repo files exist but no Remi repo is enabled: enable one, e.g. sudo dnf config-manager --set-enabled remi-safe (or remi-modular), then retry.";;
+      absent) rec "No Remi repo file found, so packages no longer update from Remi. Re-install the remi-release package for this OS.";;
+      active) rec "The Remi repo is enabled ($REPO_INFO). If no newer build is offered, run: sudo $pm clean expire-cache && $pm repolist | grep -i remi";;
+      *) rec "Verify the repo is enabled: $pm repolist | grep -i remi";;
+    esac
     rec "Update: sudo $pm clean expire-cache && sudo $pm upgrade ${remi[*]}"
     rec "Check: $pm list available ${remi[0]}   (must be at or above the fixed version: $fixed)"
   fi

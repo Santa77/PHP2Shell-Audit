@@ -75,10 +75,11 @@ echo "Exit code: $status"
 | Apache `proxy_fcgi` | Ciele `proxy:unix:…\|fcgi://…` a `fcgi://host:port` z `/etc/httpd` a `/etc/apache2` (zakomentované riadky sa ignorujú) sa mapujú rovnako ako pri nginx | Nepokrýva konfigurácie mimo týchto adresárov. Neexistujúci unix socket (pri dostupných dátach z `ss`) je mŕtva cesta: ide len do inventára |
 | Procesy | Prehliadka `/proc`; detekcia ` (deleted)` executable a `libphp` | Prístup závisí od práv; procesy v kontajneri (iný mount namespace + cgroup kontajnera) sa hlásia ako `REVIEW`. Samotný systemd sandbox (`PrivateTmp`) sa za kontajner nepovažuje |
 | Balíky a backporty | Vlastník binárky cez `dpkg-query`, `rpm`, `apk` alebo `pacman`; pri verzii pod prahom hľadá obe CVE ID v changelogu balíka (`changelog.Debian.gz`, `rpm --changelog`) | Zmienka v changelogu je indikácia. Bez podporovaného správcu balíkov ostáva `REVIEW` |
+| Repozitáre tretích strán | Pri balíkoch zo Sury/Ondřej PPA (Debian/Ubuntu) a Remi (RHEL) sa kontroluje stav zdroja: `active`, `mismatch` (séria nesedí s OS), `disabled` (napr. vypnuté po `do-release-upgrade`, vrátane `Enabled: no` v `.sources` a zvyškov `*.distUpgrade`/`*.save`), `absent` | Číta len konfiguráciu apt/yum, nerobí `apt update`. Výsledok je v inventári (`Sury apt repo: …`) a v odporúčaniach |
 | Kontajnery | Upozornenie na bežiace Docker/Podman kontajnery; zlyhanie `docker ps` je `REVIEW` | Nekontroluje PHP **vnútri** kontajnerov |
 | Vlastné inštalácie | Známe cesty a voliteľne `--deep` | Nezaručuje objavenie všetkých inštalácií, jailov a chrootov |
 
-### Prahové verzie (skript 1.5.0)
+### Prahové verzie (skript 1.6.0)
 
 Porovnávacie prahy pre *upstream* vydania sú zakódované v skripte:
 
@@ -134,7 +135,7 @@ Priorita súhrnu je **CRITICAL → REVIEW → OK**. `--help` skončí s kódom `
 ### Príklad výstupu (skrátený, zraniteľný server so Sury PPA)
 
 ```text
-PHP2Shell audit 1.5.0 | tz | 2026-10-26T20:30:22Z
+PHP2Shell audit 1.6.0 | tz | 2026-10-26T20:30:22Z
 Scope: Linux local inventory; CVE-2026-109618 / CVE-2026-109619
 
 == Findings ==
@@ -146,8 +147,8 @@ Scope: Linux local inventory; CVE-2026-109618 / CVE-2026-109619
 
 == Recommendations (ubuntu 22.04) ==
   1. Packages come from the Sury/Ondrej repo (php8.3-fpm); it ships upstream releases, so the fix is simply a newer build.
-  2. Verify the repo is enabled for this OS: grep -rhE 'ondrej|sury' /etc/apt/sources.list /etc/apt/sources.list.d/
-  3. Stale repo series: packages are built for Ubuntu 20.04 but this host is 22.04. Re-add it for this release: sudo add-apt-repository ppa:ondrej/php ...
+  2. The Sury apt repo is DISABLED (/etc/apt/sources.list.d/ondrej-ubuntu-php-focal.list.distUpgrade), typically by do-release-upgrade, so these packages no longer update. Re-enable it for this release: sudo add-apt-repository ppa:ondrej/php ..., then sudo apt update
+  3. Installed builds are from another release (packages are built for Ubuntu 20.04 but this host is 22.04), a leftover of an OS upgrade; updating will replace them.
   4. Update: sudo apt update && sudo apt install --only-upgrade php8.3-fpm
   5. Check: apt-cache policy php8.3-fpm   (Candidate must be at or above the fixed version: ...)
   6. After updating, restart so running processes load the new binaries: sudo systemctl restart php8.3-fpm
@@ -167,8 +168,8 @@ Sekcia `Recommendations` sa skladá podľa rodiny OS (z `/etc/os-release`), zdro
 | Debian/Ubuntu | `apt update && apt install --only-upgrade <balíky>` | `apt-cache policy`, `zcat /usr/share/doc/<balík>/changelog.Debian.gz \| grep CVE-…`; na Ubuntu aj `pro status` (ESM) |
 | RHEL/Oracle/Rocky/Alma | `dnf upgrade --refresh <balíky>` (alebo `yum clean expire-cache && yum upgrade`) | `updateinfo info --cve`, `rpm -q --changelog`; pri module streamoch `dnf module reset/enable php:<stream>` |
 | Alpine / Arch / SUSE | `apk upgrade` / `pacman -Syu` / `zypper update` | podľa vendor advisory |
-| Sury PPA | pozri vyššie; pri nesúlade série balíka a OS (napr. `+ubuntu20.04` na 22.04) odporučí znovu pridať `ppa:ondrej/php` | `apt-cache policy` (Candidate ≥ opravená verzia) |
-| Remi | `dnf clean expire-cache && dnf upgrade <balíky>`; kontrola `repolist \| grep remi` | `dnf list available` |
+| Sury PPA | podľa stavu repozitára: `disabled` / `mismatch` / `absent` → znovu pridať `ppa:ondrej/php` a `apt update`; `active` → skontrolovať chyby `apt update` (GPG kľúč, sieť). Nesúlad série balíka a OS (napr. `+ubuntu20.04` na 22.04) sa uvedie ako zvyšok po upgrade OS | `apt-cache policy` (Candidate ≥ opravená verzia) |
+| Remi | `dnf clean expire-cache && dnf upgrade <balíky>`; podľa stavu repozitára odporučí zapnúť `remi-safe`/`remi-modular` (`disabled`) alebo preinštalovať `remi-release` (`absent`) | `dnf list available` |
 
 Ďalej skript podľa nálezov odporučí: spustenie ako root, nápravu práv binárok, migráciu zo starej vetvy (8.1 a staršie), výmenu vlastných buildov za balík, audit kontajnerov a **reštart konkrétnych jednotiek** (odvodených z ciest: `phpX.Y-fpm`, `php-fpm`, `phpNN-php-fpm` pre Remi, `plesk-phpNN-fpm`, `apache2`/`httpd` pre `mod_php`).
 
